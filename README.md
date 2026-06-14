@@ -1,7 +1,7 @@
 # sqlite3
 
-[![GoDoc](https://godoc.org/github.com/go-sqlite/sqlite3?status.svg)](https://godoc.org/github.com/go-sqlite/sqlite3)
-[![Build Status](https://travis-ci.org/go-sqlite/sqlite3.svg?branch=master)](https://travis-ci.org/go-sqlite/sqlite3)
+[![Go Reference](https://pkg.go.dev/badge/github.com/browserutils/sqlite3.svg)](https://pkg.go.dev/github.com/browserutils/sqlite3)
+[![Build Status](https://travis-ci.org/browserutils/sqlite3.svg?branch=master)](https://travis-ci.org/browserutils/sqlite3)
 
 `sqlite3` is a pure Go package decoding the `SQLite` file format as
 described by:
@@ -19,7 +19,7 @@ It doesn't quite do that yet: so far it just parses the
 ## Installation
 
 ```sh
-$ go get github.com/go-sqlite/sqlite3
+$ go get github.com/browserutils/sqlite3
 ```
 
 ## License
@@ -35,7 +35,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/go-sqlite/sqlite3"
+	"github.com/browserutils/sqlite3"
 )
 
 func main() {

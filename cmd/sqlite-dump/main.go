@@ -26,7 +26,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/go-sqlite/sqlite3"
+	"github.com/browserutils/sqlite3"
 )
 
 func main() {
