@@ -7,17 +7,15 @@ package sqlite3
 import (
 	"fmt"
 	"io"
-	"os"
 )
 
 type pager struct {
-	f       io.ReadSeeker
-	size    int          // page size in bytes
-	npages  int          // total number of pages in db
-	pages   map[int]page // cache of pages
-	lru     []int        // list of last used pages
-	wal     *walIndex    // committed pages living in the write-ahead log, if any
-	walFile *os.File     // the -wal file backing wal
+	f      io.ReadSeeker
+	size   int          // page size in bytes
+	npages int          // total number of pages in db
+	pages  map[int]page // cache of pages
+	lru    []int        // list of last used pages
+	wal    *walIndex    // committed pages living in the write-ahead log, if any
 }
 
 func newPager(f io.ReadSeeker, size, npages int) pager {
@@ -33,10 +31,9 @@ func newPager(f io.ReadSeeker, size, npages int) pager {
 }
 
 func (p *pager) Page(i int) (page, error) {
-	var err error
 	page, ok := p.pages[i]
 	if ok {
-		return page, err
+		return page, nil
 	}
 
 	if i > p.npages {
@@ -53,7 +50,7 @@ func (p *pager) Page(i int) (page, error) {
 
 	p.pages[i] = page
 	p.lru = append(p.lru, i)
-	return page, err
+	return page, nil
 }
 
 // read fills buf with page i, preferring the write-ahead log's image of it
@@ -61,7 +58,7 @@ func (p *pager) Page(i int) (page, error) {
 func (p *pager) read(i int, buf []byte) error {
 	if p.wal != nil {
 		if off, ok := p.wal.offsets[i]; ok {
-			_, err := p.walFile.ReadAt(buf, off)
+			_, err := p.wal.f.ReadAt(buf, off)
 			return err
 		}
 	}
@@ -86,9 +83,8 @@ func (p *pager) Delete() error {
 	var err error
 	p.pages = nil
 	p.lru = nil
-	if p.walFile != nil {
-		err = p.walFile.Close()
-		p.walFile = nil
+	if p.wal != nil {
+		err = p.wal.f.Close()
 		p.wal = nil
 	}
 	return err

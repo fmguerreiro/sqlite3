@@ -30,6 +30,9 @@ const (
 
 // walIndex locates the most recent committed image of each page in a WAL.
 type walIndex struct {
+	// f is the log the offsets point into. readWALIndex leaves it nil, since
+	// it indexes any reader; openWAL sets it to the file it opened.
+	f *os.File
 	// offsets maps a page number to the offset of its page data in the WAL.
 	offsets map[int]int64
 	// dbSize is the size of the database in pages after the last commit frame,
@@ -126,22 +129,24 @@ func walChecksum(bigEndian bool, s0, s1 uint32, b []byte) (uint32, uint32) {
 }
 
 // openWAL indexes the write-ahead log next to the database at dbPath,
-// returning a nil file and index when there is no snapshot to read.
+// returning a nil index when there is no snapshot to read. The caller owns the
+// returned index's file and must close it.
 //
 // A log that cannot be opened at all is treated as absent, since a permission
 // denial or a sharing violation on it says nothing about the main file, which
 // stays perfectly readable. An I/O fault on a log already open says the
 // opposite, so those errors propagate rather than silently serving stale pages
 // in place of a snapshot that is really there.
-func openWAL(dbPath string, pageSize int) (*os.File, *walIndex, error) {
+func openWAL(dbPath string, pageSize int) (*walIndex, error) {
 	f, err := os.Open(dbPath + "-wal")
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	index, err := readWALIndex(f, pageSize)
 	if err != nil || index == nil {
 		f.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return f, index, nil
+	index.f = f
+	return index, nil
 }

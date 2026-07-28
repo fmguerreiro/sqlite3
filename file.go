@@ -120,6 +120,7 @@ func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 
 	if named, ok := f.(interface{ Name() string }); ok {
 		if err := db.attachWAL(named.Name()); err != nil {
+			db.pager.Delete()
 			return nil, err
 		}
 	}
@@ -135,26 +136,24 @@ func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 
 // attachWAL overlays the write-ahead log beside the database at dbPath, if one
 // holds a committed snapshot. Both the page count and the header itself can be
-// superseded by the log, so they are re-read from it.
+// superseded by the log, so they are re-read from it. On error the log is left
+// attached for the caller to close through the pager.
 func (db *DbFile) attachWAL(dbPath string) error {
-	walFile, index, err := openWAL(dbPath, db.PageSize())
+	index, err := openWAL(dbPath, db.PageSize())
 	if err != nil || index == nil {
 		return err
 	}
 	db.pager.wal = index
-	db.pager.walFile = walFile
 	db.pager.npages = index.dbSize
 
 	if _, ok := index.offsets[1]; ok {
 		page, err := db.pager.Page(1)
 		if err != nil {
-			db.pager.Delete()
 			return err
 		}
 		dec := binary.NewDecoder(bytes.NewReader(page.buf))
 		dec.Order = binary.BigEndian
 		if err := dec.Decode(&db.header); err != nil {
-			db.pager.Delete()
 			return err
 		}
 	}
@@ -180,11 +179,13 @@ func Open(fname string) (*DbFile, error) {
 }
 
 func (db *DbFile) Close() error {
-	db.pager.Delete()
+	err := db.pager.Delete()
 	if db.close != nil {
-		return db.close()
+		if errDB := db.close(); errDB != nil {
+			return errDB
+		}
 	}
-	return nil
+	return err
 }
 
 // PageSize returns the database page size in bytes

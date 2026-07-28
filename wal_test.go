@@ -48,16 +48,34 @@ func rowsInTbl1(t *testing.T, db *DbFile) []string {
 	return got
 }
 
-// copyDB copies the fixture database into dir, taking the log with it only when
-// withWAL is set, and returns the path of the copy.
-func copyDB(t *testing.T, dir string, withWAL bool) string {
+// copyDB copies the fixture database into a temporary directory, taking the
+// log with it only when withWAL is set. Tests mutate the copy, never the
+// fixture. The returned func removes the directory.
+func copyDB(t *testing.T, withWAL bool) (string, func()) {
 	t.Helper()
+	dir, err := ioutil.TempDir("", "sqlite3-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
 	dst := filepath.Join(dir, "wal.sqlite")
 	copyFile(t, walFixture, dst)
 	if withWAL {
 		copyFile(t, walFixture+"-wal", dst+"-wal")
 	}
-	return dst
+	return dst, func() { os.RemoveAll(dir) }
+}
+
+// assertRows opens path and checks tbl1 holds exactly want.
+func assertRows(t *testing.T, path string, want []string) {
+	t.Helper()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, want) {
+		t.Errorf("rows = %q, want %q", got, want)
+	}
 }
 
 func copyFile(t *testing.T, src, dst string) {
@@ -89,13 +107,10 @@ func TestOpenWithWAL(t *testing.T) {
 
 // Without the log beside it the same main file is a valid, older database.
 func TestOpenWithoutWAL(t *testing.T) {
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	path, cleanup := copyDB(t, false)
+	defer cleanup()
 
-	db, err := Open(copyDB(t, dir, false))
+	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -138,13 +153,8 @@ type readSeeker interface {
 // A torn frame can appear at the end of any log a writer is still appending
 // to, and must be dropped without taking the committed snapshot with it.
 func TestWALStopsAtTornTail(t *testing.T) {
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	path := copyDB(t, dir, true)
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
 	header, err := ioutil.ReadFile(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
@@ -162,27 +172,14 @@ func TestWALStopsAtTornTail(t *testing.T) {
 	}
 	log.Close()
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, walRows) {
-		t.Errorf("rows = %q, want %q", got, walRows)
-	}
+	assertRows(t, path, walRows)
 }
 
 // A log whose header does not checksum is one SQLite would ignore — typically a
 // log reset by a checkpoint — and it must not make the database unreadable.
 func TestWALWithBadHeaderIgnored(t *testing.T) {
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	path := copyDB(t, dir, true)
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
 	log, err := os.OpenFile(path+"-wal", os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -193,15 +190,7 @@ func TestWALWithBadHeaderIgnored(t *testing.T) {
 	}
 	log.Close()
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, walStaleRows) {
-		t.Errorf("rows = %q, want %q", got, walStaleRows)
-	}
+	assertRows(t, path, walStaleRows)
 }
 
 // openWAL treats a log it cannot read as absent, so the main file still reads.
@@ -209,26 +198,13 @@ func TestWALUnreadableIgnored(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads the log regardless of its mode")
 	}
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	path := copyDB(t, dir, true)
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
 	if err := os.Chmod(path+"-wal", 0); err != nil {
 		t.Fatal(err)
 	}
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, walStaleRows) {
-		t.Errorf("rows = %q, want %q", got, walStaleRows)
-	}
+	assertRows(t, path, walStaleRows)
 }
 
 // SQLite writes a log's checksums in the byte order of the machine that
@@ -238,13 +214,8 @@ func TestWALUnreadableIgnored(t *testing.T) {
 // rather than through walChecksum so that transposing the two magic constants
 // fails the test instead of cancelling out.
 func TestWALBigEndianChecksums(t *testing.T) {
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	path := copyDB(t, dir, true)
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
 	log, err := ioutil.ReadFile(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
@@ -275,15 +246,7 @@ func TestWALBigEndianChecksums(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, walRows) {
-		t.Errorf("rows = %q, want %q", got, walRows)
-	}
+	assertRows(t, path, walRows)
 }
 
 // A log can shrink the database as well as grow it, so the page count has to
@@ -311,24 +274,11 @@ func TestWALShrinksDatabase(t *testing.T) {
 
 // An empty -wal file is what a freshly checkpointed database leaves behind.
 func TestWALEmptyIgnored(t *testing.T) {
-	dir, err := ioutil.TempDir("", "sqlite3-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	path := copyDB(t, dir, false)
+	path, cleanup := copyDB(t, false)
+	defer cleanup()
 	if err := ioutil.WriteFile(path+"-wal", nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, walStaleRows) {
-		t.Errorf("rows = %q, want %q", got, walStaleRows)
-	}
+	assertRows(t, path, walStaleRows)
 }
