@@ -5,6 +5,7 @@
 package sqlite3
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -65,6 +66,12 @@ type dbHeader struct {
 	SqliteVersion int32    // SQLITE_VERSION_NUMBER
 }
 
+// OpenFrom reads the database in f.
+//
+// When f is backed by a named file (an *os.File, or any reader exposing
+// Name() string) the committed pages of a write-ahead log beside it are
+// overlaid on the database image, so a database belonging to a running
+// application reads current rather than as of its last checkpoint.
 func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 	var db DbFile
 
@@ -111,12 +118,50 @@ func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 
 	db.pager = newPager(f, db.PageSize(), db.NumPage())
 
+	if named, ok := f.(interface{ Name() string }); ok {
+		if err := db.attachWAL(named.Name()); err != nil {
+			return nil, err
+		}
+	}
+
 	err = db.init()
 	if err != nil {
+		db.pager.Delete()
 		return nil, err
 	}
 
 	return &db, err
+}
+
+// attachWAL overlays the write-ahead log beside the database at dbPath, if one
+// holds a committed snapshot. Both the page count and the header itself can be
+// superseded by the log, so they are re-read from it.
+func (db *DbFile) attachWAL(dbPath string) error {
+	walFile, index, err := openWAL(dbPath, db.PageSize())
+	if err != nil || index == nil {
+		return err
+	}
+	db.pager.wal = index
+	db.pager.walFile = walFile
+	db.pager.npages = index.dbSize
+
+	if _, ok := index.offsets[1]; ok {
+		page, err := db.pager.Page(1)
+		if err != nil {
+			db.pager.Delete()
+			return err
+		}
+		dec := binary.NewDecoder(bytes.NewReader(page.buf))
+		dec.Order = binary.BigEndian
+		if err := dec.Decode(&db.header); err != nil {
+			db.pager.Delete()
+			return err
+		}
+	}
+	// Last, because the commit frame is what states the page count and the
+	// decode above may have just put the main file's stale one back.
+	db.header.DbSize = int32(index.dbSize)
+	return nil
 }
 
 func Open(fname string) (*DbFile, error) {

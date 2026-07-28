@@ -7,14 +7,17 @@ package sqlite3
 import (
 	"fmt"
 	"io"
+	"os"
 )
 
 type pager struct {
-	f      io.ReadSeeker
-	size   int          // page size in bytes
-	npages int          // total number of pages in db
-	pages  map[int]page // cache of pages
-	lru    []int        // list of last used pages
+	f       io.ReadSeeker
+	size    int          // page size in bytes
+	npages  int          // total number of pages in db
+	pages   map[int]page // cache of pages
+	lru     []int        // list of last used pages
+	wal     *walIndex    // committed pages living in the write-ahead log, if any
+	walFile *os.File     // the -wal file backing wal
 }
 
 func newPager(f io.ReadSeeker, size, npages int) pager {
@@ -40,20 +43,9 @@ func (p *pager) Page(i int) (page, error) {
 		return page, fmt.Errorf("sqlite3: out of range (%d > %d)", i, p.npages)
 	}
 
-	pos, _ := p.f.Seek(0, io.SeekCurrent)
-	defer p.f.Seek(pos, io.SeekStart)
-
 	buf := make([]byte, p.size)
-	if _, err := p.f.Seek(int64((i-1)*p.size), io.SeekStart); err != nil {
+	if err := p.read(i, buf); err != nil {
 		return page, err
-	}
-	n, err := p.f.Read(buf)
-	if err != nil {
-		return page, err
-	}
-
-	if n != len(buf) {
-		return page, fmt.Errorf("sqlite3: read too few bytes")
 	}
 
 	page.id = i
@@ -64,9 +56,40 @@ func (p *pager) Page(i int) (page, error) {
 	return page, err
 }
 
+// read fills buf with page i, preferring the write-ahead log's image of it
+// over the one in the main database file.
+func (p *pager) read(i int, buf []byte) error {
+	if p.wal != nil {
+		if off, ok := p.wal.offsets[i]; ok {
+			_, err := p.walFile.ReadAt(buf, off)
+			return err
+		}
+	}
+
+	pos, _ := p.f.Seek(0, io.SeekCurrent)
+	defer p.f.Seek(pos, io.SeekStart)
+
+	if _, err := p.f.Seek(int64((i-1)*p.size), io.SeekStart); err != nil {
+		return err
+	}
+	n, err := p.f.Read(buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return fmt.Errorf("sqlite3: read too few bytes")
+	}
+	return nil
+}
+
 func (p *pager) Delete() error {
 	var err error
 	p.pages = nil
 	p.lru = nil
+	if p.walFile != nil {
+		err = p.walFile.Close()
+		p.walFile = nil
+		p.wal = nil
+	}
 	return err
 }
