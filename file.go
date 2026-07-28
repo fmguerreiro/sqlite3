@@ -116,14 +116,23 @@ func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 		)
 	}
 
-	db.pager = newPager(f, db.PageSize(), db.NumPage())
-
+	var wal *walIndex
 	if named, ok := f.(interface{ Name() string }); ok {
-		if err := db.attachWAL(named.Name()); err != nil {
-			db.pager.Delete()
+		wal, err = openWAL(named.Name(), db.PageSize())
+		if err != nil {
 			return nil, err
 		}
 	}
+	if wal != nil {
+		// Before the pager, so that the page count it is built with is the
+		// log's rather than the main file's stale one.
+		if err := db.applyWALHeader(wal); err != nil {
+			wal.Close()
+			return nil, err
+		}
+	}
+
+	db.pager = newPager(f, db.PageSize(), db.NumPage(), wal)
 
 	err = db.init()
 	if err != nil {
@@ -134,32 +143,38 @@ func OpenFrom(f io.ReadSeeker) (*DbFile, error) {
 	return &db, err
 }
 
-// attachWAL overlays the write-ahead log beside the database at dbPath, if one
-// holds a committed snapshot. Both the page count and the header itself can be
-// superseded by the log, so they are re-read from it. On error the log is left
-// attached for the caller to close through the pager.
-func (db *DbFile) attachWAL(dbPath string) error {
-	index, err := openWAL(dbPath, db.PageSize())
-	if err != nil || index == nil {
+// applyWALHeader supersedes the header with the log's newer image of page 1,
+// when the log carries one, and takes the page count from its last commit
+// frame either way.
+func (db *DbFile) applyWALHeader(wal *walIndex) error {
+	pageSize := db.PageSize()
+	buf := make([]byte, pageSize)
+	ok, err := wal.page(1, buf)
+	if err != nil {
 		return err
 	}
-	db.pager.wal = index
-	db.pager.npages = index.dbSize
-
-	if _, ok := index.offsets[1]; ok {
-		page, err := db.pager.Page(1)
-		if err != nil {
-			return err
-		}
-		dec := binary.NewDecoder(bytes.NewReader(page.buf))
+	if ok {
+		dec := binary.NewDecoder(bytes.NewReader(buf))
 		dec.Order = binary.BigEndian
 		if err := dec.Decode(&db.header); err != nil {
 			return err
 		}
+		// The magic check above ran against the main file's page 1, so the
+		// log's replacement for it has to clear the same bar. A page size of
+		// zero would otherwise reach the pager and read empty pages forever.
+		if string(db.header.Magic[:]) != sqlite3Magic {
+			return fmt.Errorf("sqlite3: invalid file header in write-ahead log")
+		}
+		if db.PageSize() != pageSize {
+			return fmt.Errorf(
+				"sqlite3: write-ahead log page 1 changes the page size (%d -> %d)",
+				pageSize, db.PageSize(),
+			)
+		}
 	}
 	// Last, because the commit frame is what states the page count and the
 	// decode above may have just put the main file's stale one back.
-	db.header.DbSize = int32(index.dbSize)
+	db.header.DbSize = int32(wal.dbSize)
 	return nil
 }
 

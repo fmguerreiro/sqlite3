@@ -6,7 +6,9 @@ package sqlite3
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
+	"math"
 	"os"
 )
 
@@ -26,18 +28,49 @@ const (
 	// SQLITE_BIGENDIAN test. The format page's prose reads the other way round.
 	walMagicLittleEndian = 0x377f0682
 	walMagicBigEndian    = 0x377f0683
+
+	// The only format version wal.c writes or accepts.
+	walFormatVersion = 3007000
 )
 
 // walIndex locates the most recent committed image of each page in a WAL.
 type walIndex struct {
-	// f is the log the offsets point into. readWALIndex leaves it nil, since
-	// it indexes any reader; openWAL sets it to the file it opened.
+	// f is the log the offsets point into; nil until openWAL sets it
+	// (readWALIndex indexes any reader), so every index reaching a pager has one.
 	f *os.File
-	// offsets maps a page number to the offset of its page data in the WAL.
+	// offsets maps a page number to the offset of its frame in the WAL.
 	offsets map[int]int64
+	// salt is the header's, repeated in every frame belonging to this
+	// generation of the log.
+	salt [8]byte
 	// dbSize is the size of the database in pages after the last commit frame,
 	// which supersedes the size recorded in the main file's header.
 	dbSize int
+}
+
+// page reads the log's image of page i into buf, reporting whether the log
+// carries one. A page it does not carry is left to the main database file.
+func (w *walIndex) page(i int, buf []byte) (bool, error) {
+	off, ok := w.offsets[i]
+	if !ok {
+		return false, nil
+	}
+	// A checkpoint can restart the log between the scan and this read, leaving
+	// the offset pointing into a later generation's frame; re-reading the frame
+	// header turns that into an error instead of a wrong page.
+	var header [walFrameHeaderSize]byte
+	if _, err := w.f.ReadAt(header[:], off); err != nil {
+		return true, err
+	}
+	if binary.BigEndian.Uint32(header[0:4]) != uint32(i) || string(header[8:16]) != string(w.salt[:]) {
+		return true, fmt.Errorf("sqlite3: write-ahead log changed while being read")
+	}
+	_, err := w.f.ReadAt(buf, off+walFrameHeaderSize)
+	return true, err
+}
+
+func (w *walIndex) Close() error {
+	return w.f.Close()
 }
 
 // readWALIndex scans the WAL in f and indexes every page belonging to a
@@ -53,27 +86,32 @@ func readWALIndex(f io.ReaderAt, pageSize int) (*walIndex, error) {
 		return nil, err
 	}
 
-	var bigEndian bool
+	var order binary.ByteOrder = binary.LittleEndian
 	switch binary.BigEndian.Uint32(header[0:4]) {
 	case walMagicLittleEndian:
-		bigEndian = false
 	case walMagicBigEndian:
-		bigEndian = true
+		order = binary.BigEndian
 	default:
+		return nil, nil
+	}
+	// A later format may keep the magic and reuse these fields differently.
+	if binary.BigEndian.Uint32(header[4:8]) != walFormatVersion {
 		return nil, nil
 	}
 
 	// A torn or reset header means there is no snapshot to read.
-	s0, s1 := walChecksum(bigEndian, 0, 0, header[0:24])
+	s0, s1 := walChecksum(order, 0, 0, header[0:24])
 	if s0 != binary.BigEndian.Uint32(header[24:28]) || s1 != binary.BigEndian.Uint32(header[28:32]) {
 		return nil, nil
 	}
+	// The pager reads fixed-size pages, so a log written at another page size
+	// is no more usable here than an absent one.
 	if int(binary.BigEndian.Uint32(header[8:12])) != pageSize {
 		return nil, nil
 	}
-	salt := header[16:24]
 
 	index := &walIndex{offsets: make(map[int]int64)}
+	copy(index.salt[:], header[16:24])
 	// Frames after the last commit frame belong to a transaction that was never
 	// committed, so they are staged here and only merged when a commit is seen.
 	pending := make(map[int]int64)
@@ -88,18 +126,28 @@ func readWALIndex(f io.ReaderAt, pageSize int) (*walIndex, error) {
 		}
 		// A salt mismatch marks where a later checkpoint restarted the log and
 		// left older frames behind.
-		if string(frame[8:16]) != string(salt) {
+		if string(frame[8:16]) != string(index.salt[:]) {
 			break
 		}
-		c0, c1 := walChecksum(bigEndian, s0, s1, frame[0:8])
-		c0, c1 = walChecksum(bigEndian, c0, c1, frame[walFrameHeaderSize:])
+		c0, c1 := walChecksum(order, s0, s1, frame[0:8])
+		c0, c1 = walChecksum(order, c0, c1, frame[walFrameHeaderSize:])
 		if c0 != binary.BigEndian.Uint32(frame[16:20]) || c1 != binary.BigEndian.Uint32(frame[20:24]) {
 			break
 		}
 		s0, s1 = c0, c1
 
-		pending[int(binary.BigEndian.Uint32(frame[0:4]))] = offset + walFrameHeaderSize
-		if dbSize := binary.BigEndian.Uint32(frame[4:8]); dbSize != 0 {
+		// Page 0 does not exist; wal.c rejects such a frame outright.
+		pgno := binary.BigEndian.Uint32(frame[0:4])
+		if pgno == 0 {
+			break
+		}
+		dbSize := binary.BigEndian.Uint32(frame[4:8])
+		if dbSize > math.MaxInt32 {
+			break
+		}
+
+		pending[int(pgno)] = offset
+		if dbSize != 0 {
 			for page, at := range pending {
 				index.offsets[page] = at
 			}
@@ -115,12 +163,8 @@ func readWALIndex(f io.ReaderAt, pageSize int) (*walIndex, error) {
 }
 
 // walChecksum continues SQLite's running WAL checksum over b, which must be a
-// whole number of 8-byte blocks.
-func walChecksum(bigEndian bool, s0, s1 uint32, b []byte) (uint32, uint32) {
-	order := binary.ByteOrder(binary.LittleEndian)
-	if bigEndian {
-		order = binary.BigEndian
-	}
+// whole number of 8-byte blocks. The log records its own word order.
+func walChecksum(order binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
 	for i := 0; i+8 <= len(b); i += 8 {
 		s0 += order.Uint32(b[i:i+4]) + s1
 		s1 += order.Uint32(b[i+4:i+8]) + s0
@@ -128,15 +172,13 @@ func walChecksum(bigEndian bool, s0, s1 uint32, b []byte) (uint32, uint32) {
 	return s0, s1
 }
 
-// openWAL indexes the write-ahead log next to the database at dbPath,
-// returning a nil index when there is no snapshot to read. The caller owns the
-// returned index's file and must close it.
+// openWAL indexes the write-ahead log next to the database at dbPath, returning
+// a nil index when there is no snapshot to read; the caller owns the returned
+// index's file and must close it.
 //
-// A log that cannot be opened at all is treated as absent, since a permission
-// denial or a sharing violation on it says nothing about the main file, which
-// stays perfectly readable. An I/O fault on a log already open says the
-// opposite, so those errors propagate rather than silently serving stale pages
-// in place of a snapshot that is really there.
+// A log that cannot be opened is treated as absent (a permission or sharing
+// error there says nothing about the main file), but an I/O fault on a log
+// already open propagates rather than silently serving stale pages.
 func openWAL(dbPath string, pageSize int) (*walIndex, error) {
 	f, err := os.Open(dbPath + "-wal")
 	if err != nil {

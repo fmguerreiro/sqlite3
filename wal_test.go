@@ -5,6 +5,7 @@
 package sqlite3
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io/ioutil"
 	"os"
@@ -207,12 +208,10 @@ func TestWALUnreadableIgnored(t *testing.T) {
 	assertRows(t, path, walStaleRows)
 }
 
-// SQLite writes a log's checksums in the byte order of the machine that
-// created it, so a log from a big-endian host uses the other magic number and
-// the other word order. There is no fixture from such a host to hand, so this
-// rewrites the little-endian one into that form, computing the checksums here
-// rather than through walChecksum so that transposing the two magic constants
-// fails the test instead of cancelling out.
+// SQLite writes a log's checksums in the byte order of the machine that created
+// it; there is no big-endian fixture, so this flips a little-endian one and
+// recomputes the checksums by hand rather than via walChecksum, so that
+// transposing the two magic constants fails instead of cancelling out.
 func TestWALBigEndianChecksums(t *testing.T) {
 	path, cleanup := copyDB(t, true)
 	defer cleanup()
@@ -249,10 +248,8 @@ func TestWALBigEndianChecksums(t *testing.T) {
 	assertRows(t, path, walRows)
 }
 
-// A log can shrink the database as well as grow it, so the page count has to
-// come from the commit frame rather than the main file's header. In
-// testdata/wal-shrink.sqlite an auto-vacuuming database dropped 60 rows in the
-// logged transaction, taking it from 34 pages to 4.
+// testdata/wal-shrink.sqlite: an auto-vacuuming transaction drops 60 rows and
+// takes the database from 34 pages to 4. The shrink case for walIndex.dbSize.
 func TestWALShrinksDatabase(t *testing.T) {
 	db, err := Open("testdata/wal-shrink.sqlite")
 	if err != nil {
@@ -269,6 +266,230 @@ func TestWALShrinksDatabase(t *testing.T) {
 	want := []string{"checkpointed", "in-wal-a"}
 	if got := rowsInTbl1(t, db); !reflect.DeepEqual(got, want) {
 		t.Errorf("rows = %q, want %q", got, want)
+	}
+}
+
+// testdata/wal-grow.sqlite is 2 pages on disk; the logged transaction inserts
+// 200 rows and commits at 5. The grow case for walIndex.dbSize, and the
+// ordinary state of a database belonging to a running application.
+func TestWALGrowsDatabase(t *testing.T) {
+	db, err := Open("testdata/wal-grow.sqlite")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if got, want := db.NumPage(), 5; got != want {
+		t.Errorf("NumPage() = %d, want %d", got, want)
+	}
+	// Page 5 lives only in the log; the main file stops after page 2.
+	if _, err := db.pager.Page(5); err != nil {
+		t.Errorf("Page(5): %v", err)
+	}
+	if got, want := len(rowsInTbl1(t, db)), 201; got != want {
+		t.Errorf("len(rows) = %d, want %d", got, want)
+	}
+}
+
+// A log restarted under a reader must fail the read, rather than serve a frame
+// from the new generation as the page it used to be.
+func TestWALDetectsRestartUnderReader(t *testing.T) {
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
+
+	index, err := openWAL(path, 1024)
+	if err != nil {
+		t.Fatalf("openWAL: %v", err)
+	}
+	if index == nil {
+		t.Fatal("openWAL returned no index for the fixture log")
+	}
+	defer index.Close()
+
+	buf := make([]byte, 1024)
+	if ok, err := index.page(1, buf); !ok || err != nil {
+		t.Fatalf("page(1) = %v, %v; want true, nil", ok, err)
+	}
+
+	// Rewrite the salt of the frame the index points at, as a restarted log
+	// would. The index still holds the old salt.
+	log, err := os.OpenFile(path+"-wal", os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.WriteAt([]byte{0, 0, 0, 0, 0, 0, 0, 0}, index.offsets[1]+8); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+
+	if ok, err := index.page(1, buf); !ok || err == nil {
+		t.Errorf("page(1) = %v, %v; want true and an error", ok, err)
+	}
+}
+
+// A zeroed page 1 in the log must fail Open, rather than reach the pager as a
+// page size of zero.
+func TestWALRejectsBadHeaderPage(t *testing.T) {
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
+	log, err := ioutil.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The fixture's last frame carries page 1. Blanking its payload keeps the
+	// frame well-formed once the checksums are recomputed over it.
+	last := walHeaderSize
+	for last+2*(walFrameHeaderSize+1024) <= len(log) {
+		last += walFrameHeaderSize + 1024
+	}
+	if got := binary.BigEndian.Uint32(log[last : last+4]); got != 1 {
+		t.Fatalf("last frame carries page %d, want page 1", got)
+	}
+	payload := log[last+walFrameHeaderSize:]
+	for i := range payload {
+		payload[i] = 0
+	}
+	resealWAL(t, log, 1024)
+	if err := ioutil.WriteFile(path+"-wal", log, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err == nil {
+		db.Close()
+		t.Fatal("Open accepted a log whose page 1 is not a database header")
+	}
+}
+
+// resealWAL recomputes the little-endian checksum chain over log in place, so
+// a test can edit frame payloads and still hand back a log that verifies.
+func resealWAL(t *testing.T, log []byte, pageSize int) {
+	t.Helper()
+	sum := func(s0, s1 uint32, b []byte) (uint32, uint32) {
+		for i := 0; i+8 <= len(b); i += 8 {
+			s0 += binary.LittleEndian.Uint32(b[i:i+4]) + s1
+			s1 += binary.LittleEndian.Uint32(b[i+4:i+8]) + s0
+		}
+		return s0, s1
+	}
+	s0, s1 := sum(0, 0, log[0:24])
+	binary.BigEndian.PutUint32(log[24:28], s0)
+	binary.BigEndian.PutUint32(log[28:32], s1)
+	frame := walFrameHeaderSize + pageSize
+	for off := walHeaderSize; off+frame <= len(log); off += frame {
+		f := log[off : off+frame]
+		s0, s1 = sum(s0, s1, f[0:8])
+		s0, s1 = sum(s0, s1, f[walFrameHeaderSize:])
+		binary.BigEndian.PutUint32(f[16:20], s0)
+		binary.BigEndian.PutUint32(f[20:24], s1)
+	}
+}
+
+// walFrame is one frame to assemble into a synthetic log. A dbSize of zero
+// makes it a non-commit frame.
+type walFrame struct {
+	pgno   uint32
+	dbSize uint32
+}
+
+// buildWAL assembles a little-endian write-ahead log. The checksums are
+// computed here rather than through walChecksum, so that a bug in the latter
+// cannot cancel itself out. magic and version are parameters because rejecting
+// the wrong ones is most of what these tests check.
+func buildWAL(magic, version uint32, pageSize int, frames []walFrame) []byte {
+	sum := func(s0, s1 uint32, b []byte) (uint32, uint32) {
+		for i := 0; i+8 <= len(b); i += 8 {
+			s0 += binary.LittleEndian.Uint32(b[i:i+4]) + s1
+			s1 += binary.LittleEndian.Uint32(b[i+4:i+8]) + s0
+		}
+		return s0, s1
+	}
+
+	log := make([]byte, walHeaderSize)
+	binary.BigEndian.PutUint32(log[0:4], magic)
+	binary.BigEndian.PutUint32(log[4:8], version)
+	binary.BigEndian.PutUint32(log[8:12], uint32(pageSize))
+	copy(log[16:24], []byte("saltsalt"))
+	s0, s1 := sum(0, 0, log[0:24])
+	binary.BigEndian.PutUint32(log[24:28], s0)
+	binary.BigEndian.PutUint32(log[28:32], s1)
+
+	for _, f := range frames {
+		frame := make([]byte, walFrameHeaderSize+pageSize)
+		binary.BigEndian.PutUint32(frame[0:4], f.pgno)
+		binary.BigEndian.PutUint32(frame[4:8], f.dbSize)
+		copy(frame[8:16], log[16:24])
+		s0, s1 = sum(s0, s1, frame[0:8])
+		s0, s1 = sum(s0, s1, frame[walFrameHeaderSize:])
+		binary.BigEndian.PutUint32(frame[16:20], s0)
+		binary.BigEndian.PutUint32(frame[20:24], s1)
+		log = append(log, frame...)
+	}
+	return log
+}
+
+// Logs SQLite would refuse, or this package cannot apply. Each must read as
+// "no snapshot here" rather than as an error, so the main file still opens.
+func TestReadWALIndexRejects(t *testing.T) {
+	const pageSize = 1024
+	commit := []walFrame{{pgno: 1, dbSize: 1}}
+
+	// Frames laid out at the size readWALIndex is called with, but a header
+	// declaring another. Everything else about the log verifies, so only the
+	// page-size check can turn it away.
+	mislabelled := buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, commit)
+	binary.BigEndian.PutUint32(mislabelled[8:12], 512)
+	resealWAL(t, mislabelled, pageSize)
+
+	tests := []struct {
+		name string
+		log  []byte
+	}{
+		{"wrong magic", buildWAL(0xdeadbeef, walFormatVersion, pageSize, commit)},
+		{"future format version", buildWAL(walMagicLittleEndian, walFormatVersion+1, pageSize, commit)},
+		{"other page size", mislabelled},
+		{"page zero", buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, []walFrame{{pgno: 0, dbSize: 1}})},
+		{"page count overflows int32", buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, []walFrame{{pgno: 1, dbSize: 1 << 31}})},
+		{"no commit frame", buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, []walFrame{{pgno: 1}})},
+		{"header only", buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, nil)},
+	}
+	for _, tt := range tests {
+		index, err := readWALIndex(bytes.NewReader(tt.log), pageSize)
+		if err != nil {
+			t.Errorf("%s: readWALIndex: %v", tt.name, err)
+			continue
+		}
+		if index != nil {
+			t.Errorf("%s: indexed %d pages, want no index", tt.name, len(index.offsets))
+		}
+	}
+}
+
+// The positive control for the table above, and for the rule that only frames
+// up to the last commit frame count.
+func TestReadWALIndexAppliesCommittedFrames(t *testing.T) {
+	const pageSize = 1024
+	log := buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, []walFrame{
+		{pgno: 1},
+		{pgno: 2, dbSize: 2},
+		{pgno: 3}, // after the commit, so uncommitted
+	})
+
+	index, err := readWALIndex(bytes.NewReader(log), pageSize)
+	if err != nil {
+		t.Fatalf("readWALIndex: %v", err)
+	}
+	if index == nil {
+		t.Fatal("readWALIndex returned no index for a committed log")
+	}
+	frame := int64(walFrameHeaderSize + pageSize)
+	want := map[int]int64{1: walHeaderSize, 2: walHeaderSize + frame}
+	if !reflect.DeepEqual(index.offsets, want) {
+		t.Errorf("offsets = %v, want %v", index.offsets, want)
+	}
+	if index.dbSize != 2 {
+		t.Errorf("dbSize = %d, want 2", index.dbSize)
 	}
 }
 

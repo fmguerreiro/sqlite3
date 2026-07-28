@@ -18,13 +18,14 @@ type pager struct {
 	wal    *walIndex    // committed pages living in the write-ahead log, if any
 }
 
-func newPager(f io.ReadSeeker, size, npages int) pager {
+func newPager(f io.ReadSeeker, size, npages int, wal *walIndex) pager {
 	pager := pager{
 		f:      f,
 		size:   size,
 		npages: npages,
 		pages:  make(map[int]page, npages),
 		lru:    make([]int, 0, 2),
+		wal:    wal,
 	}
 
 	return pager
@@ -57,8 +58,7 @@ func (p *pager) Page(i int) (page, error) {
 // over the one in the main database file.
 func (p *pager) read(i int, buf []byte) error {
 	if p.wal != nil {
-		if off, ok := p.wal.offsets[i]; ok {
-			_, err := p.wal.f.ReadAt(buf, off)
+		if ok, err := p.wal.page(i, buf); ok || err != nil {
 			return err
 		}
 	}
@@ -84,7 +84,7 @@ func (p *pager) Delete() error {
 	p.pages = nil
 	p.lru = nil
 	if p.wal != nil {
-		err = p.wal.f.Close()
+		err = p.wal.Close()
 		p.wal = nil
 	}
 	return err
