@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -209,9 +210,9 @@ func TestWALUnreadableIgnored(t *testing.T) {
 }
 
 // SQLite writes a log's checksums in the byte order of the machine that created
-// it; there is no big-endian fixture, so this flips a little-endian one and
-// recomputes the checksums by hand rather than via walChecksum, so that
-// transposing the two magic constants fails instead of cancelling out.
+// it, so a log from a big-endian host carries the other magic number and the
+// other word order. There is no fixture from such a host to hand, so this makes
+// one out of the little-endian fixture.
 func TestWALBigEndianChecksums(t *testing.T) {
 	path, cleanup := copyDB(t, true)
 	defer cleanup()
@@ -220,27 +221,8 @@ func TestWALBigEndianChecksums(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sum := func(s0, s1 uint32, b []byte) (uint32, uint32) {
-		for i := 0; i+8 <= len(b); i += 8 {
-			s0 += binary.BigEndian.Uint32(b[i:i+4]) + s1
-			s1 += binary.BigEndian.Uint32(b[i+4:i+8]) + s0
-		}
-		return s0, s1
-	}
-
 	binary.BigEndian.PutUint32(log[0:4], walMagicBigEndian)
-	s0, s1 := sum(0, 0, log[0:24])
-	binary.BigEndian.PutUint32(log[24:28], s0)
-	binary.BigEndian.PutUint32(log[28:32], s1)
-
-	frame := walFrameHeaderSize + 1024
-	for off := walHeaderSize; off+frame <= len(log); off += frame {
-		f := log[off : off+frame]
-		s0, s1 = sum(s0, s1, f[0:8])
-		s0, s1 = sum(s0, s1, f[walFrameHeaderSize:])
-		binary.BigEndian.PutUint32(f[16:20], s0)
-		binary.BigEndian.PutUint32(f[20:24], s1)
-	}
+	sealWAL(binary.BigEndian, log, 1024)
 	if err := ioutil.WriteFile(path+"-wal", log, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -327,49 +309,79 @@ func TestWALDetectsRestartUnderReader(t *testing.T) {
 	}
 }
 
-// A zeroed page 1 in the log must fail Open, rather than reach the pager as a
-// page size of zero.
+// The log's page 1 replaces the database header, so it has to clear the same
+// bar the main file's page 1 did. A zeroed one used to reach the pager as a
+// page size of zero and panic there; one with the wrong magic is not a
+// database header at all.
 func TestWALRejectsBadHeaderPage(t *testing.T) {
-	path, cleanup := copyDB(t, true)
+	real1, err := ioutil.ReadFile(walFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongMagic := append([]byte(nil), real1[:1024]...)
+	wrongMagic[0] = 'X'
+
+	tests := []struct {
+		name  string
+		page1 []byte
+	}{
+		// Zeroed is the panic that actually happened. Wrong magic keeps a
+		// valid page size, so only the magic check can turn it away.
+		{"zeroed", nil},
+		{"wrong magic", wrongMagic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, cleanup := copyDB(t, false)
+			defer cleanup()
+			writeWAL(t, path, buildWAL(walMagicLittleEndian, walFormatVersion, 1024,
+				[]walFrame{{pgno: 1, dbSize: 2, page: tt.page1}}))
+
+			db, err := Open(path)
+			if err == nil {
+				db.Close()
+				t.Error("Open accepted a log whose page 1 is not a database header")
+			}
+		})
+	}
+}
+
+// A page 1 that is a valid header but disagrees with the main file about the
+// page size cannot be applied to a pager already sized for the main file.
+func TestWALRejectsHeaderPageResize(t *testing.T) {
+	path, cleanup := copyDB(t, false)
 	defer cleanup()
-	log, err := ioutil.ReadFile(path + "-wal")
+	main, err := ioutil.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// The fixture's last frame carries page 1. Blanking its payload keeps the
-	// frame well-formed once the checksums are recomputed over it.
-	last := walHeaderSize
-	for last+2*(walFrameHeaderSize+1024) <= len(log) {
-		last += walFrameHeaderSize + 1024
-	}
-	if got := binary.BigEndian.Uint32(log[last : last+4]); got != 1 {
-		t.Fatalf("last frame carries page %d, want page 1", got)
-	}
-	payload := log[last+walFrameHeaderSize:]
-	for i := range payload {
-		payload[i] = 0
-	}
-	resealWAL(t, log, 1024)
-	if err := ioutil.WriteFile(path+"-wal", log, 0644); err != nil {
-		t.Fatal(err)
-	}
+	// The real page 1, so the magic still passes, with only the page-size
+	// field changed.
+	page1 := append([]byte(nil), main[:1024]...)
+	binary.BigEndian.PutUint16(page1[16:18], 512)
+	writeWAL(t, path, buildWAL(walMagicLittleEndian, walFormatVersion, 1024,
+		[]walFrame{{pgno: 1, dbSize: 2, page: page1}}))
 
 	db, err := Open(path)
 	if err == nil {
 		db.Close()
-		t.Fatal("Open accepted a log whose page 1 is not a database header")
+		t.Fatal("Open accepted a log whose page 1 changes the page size")
+	}
+	if !strings.Contains(err.Error(), "changes the page size") {
+		t.Errorf("Open: %v, want a page-size error", err)
 	}
 }
 
-// resealWAL recomputes the little-endian checksum chain over log in place, so
-// a test can edit frame payloads and still hand back a log that verifies.
-func resealWAL(t *testing.T, log []byte, pageSize int) {
-	t.Helper()
+// sealWAL recomputes the checksum chain over log in place, so a test can edit a
+// header field or a frame payload and still hand back a log that verifies. The
+// chain is spelled out here rather than called through walChecksum, so that a
+// bug in the latter cannot cancel itself out.
+func sealWAL(order binary.ByteOrder, log []byte, pageSize int) {
 	sum := func(s0, s1 uint32, b []byte) (uint32, uint32) {
 		for i := 0; i+8 <= len(b); i += 8 {
-			s0 += binary.LittleEndian.Uint32(b[i:i+4]) + s1
-			s1 += binary.LittleEndian.Uint32(b[i+4:i+8]) + s0
+			s0 += order.Uint32(b[i:i+4]) + s1
+			s1 += order.Uint32(b[i+4:i+8]) + s0
 		}
 		return s0, s1
 	}
@@ -387,23 +399,21 @@ func resealWAL(t *testing.T, log []byte, pageSize int) {
 }
 
 // walFrame is one frame to assemble into a synthetic log. A dbSize of zero
-// makes it a non-commit frame.
+// makes it a non-commit frame; a nil page leaves the payload zeroed.
 type walFrame struct {
 	pgno   uint32
 	dbSize uint32
+	page   []byte
 }
 
-// buildWAL assembles a little-endian write-ahead log. The checksums are
-// computed here rather than through walChecksum, so that a bug in the latter
-// cannot cancel itself out. magic and version are parameters because rejecting
-// the wrong ones is most of what these tests check.
+// buildWAL assembles a write-ahead log and seals it, so the result verifies as
+// it stands. magic and version are parameters because rejecting the wrong ones
+// is most of what these tests check; the word order follows the magic, as it
+// does in a real log.
 func buildWAL(magic, version uint32, pageSize int, frames []walFrame) []byte {
-	sum := func(s0, s1 uint32, b []byte) (uint32, uint32) {
-		for i := 0; i+8 <= len(b); i += 8 {
-			s0 += binary.LittleEndian.Uint32(b[i:i+4]) + s1
-			s1 += binary.LittleEndian.Uint32(b[i+4:i+8]) + s0
-		}
-		return s0, s1
+	order := binary.ByteOrder(binary.LittleEndian)
+	if magic == walMagicBigEndian {
+		order = binary.BigEndian
 	}
 
 	log := make([]byte, walHeaderSize)
@@ -411,22 +421,73 @@ func buildWAL(magic, version uint32, pageSize int, frames []walFrame) []byte {
 	binary.BigEndian.PutUint32(log[4:8], version)
 	binary.BigEndian.PutUint32(log[8:12], uint32(pageSize))
 	copy(log[16:24], []byte("saltsalt"))
-	s0, s1 := sum(0, 0, log[0:24])
-	binary.BigEndian.PutUint32(log[24:28], s0)
-	binary.BigEndian.PutUint32(log[28:32], s1)
 
 	for _, f := range frames {
 		frame := make([]byte, walFrameHeaderSize+pageSize)
 		binary.BigEndian.PutUint32(frame[0:4], f.pgno)
 		binary.BigEndian.PutUint32(frame[4:8], f.dbSize)
 		copy(frame[8:16], log[16:24])
-		s0, s1 = sum(s0, s1, frame[0:8])
-		s0, s1 = sum(s0, s1, frame[walFrameHeaderSize:])
-		binary.BigEndian.PutUint32(frame[16:20], s0)
-		binary.BigEndian.PutUint32(frame[20:24], s1)
+		copy(frame[walFrameHeaderSize:], f.page)
 		log = append(log, frame...)
 	}
+	sealWAL(order, log, pageSize)
 	return log
+}
+
+// writeWAL lays log beside the database at path.
+func writeWAL(t *testing.T, path string, log []byte) {
+	t.Helper()
+	if err := ioutil.WriteFile(path+"-wal", log, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The log overlays the main file rather than replacing it, so a page it does
+// not carry still has to come from the main file. Every other fixture happens
+// to log every page it commits, which never exercises the fall-through.
+func TestWALFallsThroughToMainFile(t *testing.T) {
+	path, cleanup := copyDB(t, false)
+	defer cleanup()
+	main, err := ioutil.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A log carrying page 1 unchanged and committing at the main file's size.
+	// The rows live on page 2, which only the main file has.
+	writeWAL(t, path, buildWAL(walMagicLittleEndian, walFormatVersion, 1024,
+		[]walFrame{{pgno: 1, dbSize: 2, page: main[:1024]}}))
+
+	assertRows(t, path, walStaleRows)
+}
+
+// A checkpoint restarts the log with a fresh salt and writes over the old
+// frames in place, so the scan has to stop at the first frame carrying a salt
+// other than the header's rather than read into the previous generation.
+func TestReadWALIndexStopsAtSaltChange(t *testing.T) {
+	const pageSize = 1024
+	log := buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, []walFrame{
+		{pgno: 1, dbSize: 1},
+		{pgno: 2, dbSize: 2},
+	})
+	second := walHeaderSize + walFrameHeaderSize + pageSize
+	copy(log[second+8:second+16], []byte("OTHERSLT"))
+	sealWAL(binary.LittleEndian, log, pageSize)
+
+	index, err := readWALIndex(bytes.NewReader(log), pageSize)
+	if err != nil {
+		t.Fatalf("readWALIndex: %v", err)
+	}
+	if index == nil {
+		t.Fatal("readWALIndex dropped the frames before the salt change")
+	}
+	want := map[int]int64{1: walHeaderSize}
+	if !reflect.DeepEqual(index.offsets, want) {
+		t.Errorf("offsets = %v, want %v", index.offsets, want)
+	}
+	if index.dbSize != 1 {
+		t.Errorf("dbSize = %d, want 1", index.dbSize)
+	}
 }
 
 // Logs SQLite would refuse, or this package cannot apply. Each must read as
@@ -440,7 +501,7 @@ func TestReadWALIndexRejects(t *testing.T) {
 	// page-size check can turn it away.
 	mislabelled := buildWAL(walMagicLittleEndian, walFormatVersion, pageSize, commit)
 	binary.BigEndian.PutUint32(mislabelled[8:12], 512)
-	resealWAL(t, mislabelled, pageSize)
+	sealWAL(binary.LittleEndian, mislabelled, pageSize)
 
 	tests := []struct {
 		name string

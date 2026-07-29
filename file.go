@@ -172,8 +172,8 @@ func (db *DbFile) applyWALHeader(wal *walIndex) error {
 			)
 		}
 	}
-	// Last, because the commit frame is what states the page count and the
-	// decode above may have just put the main file's stale one back.
+	// Last: the decode above may have just put the main file's stale page
+	// count back.
 	db.header.DbSize = int32(wal.dbSize)
 	return nil
 }

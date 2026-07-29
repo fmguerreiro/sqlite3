@@ -56,8 +56,9 @@ func (w *walIndex) page(i int, buf []byte) (bool, error) {
 		return false, nil
 	}
 	// A checkpoint can restart the log between the scan and this read, leaving
-	// the offset pointing into a later generation's frame; re-reading the frame
-	// header turns that into an error instead of a wrong page.
+	// the offset pointing into a later generation's frame. Re-reading the frame
+	// header catches that in every case but a restart that draws the same salt,
+	// which is as much as can be had without rewalking the checksum chain.
 	var header [walFrameHeaderSize]byte
 	if _, err := w.f.ReadAt(header[:], off); err != nil {
 		return true, err

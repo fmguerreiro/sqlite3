@@ -23,9 +23,11 @@ func newPager(f io.ReadSeeker, size, npages int, wal *walIndex) pager {
 		f:      f,
 		size:   size,
 		npages: npages,
-		pages:  make(map[int]page, npages),
-		lru:    make([]int, 0, 2),
-		wal:    wal,
+		// No size hint: npages comes from a file header, and a hostile one can
+		// ask for MaxInt32 pages. The cache only ever holds pages read.
+		pages: make(map[int]page),
+		lru:   make([]int, 0, 2),
+		wal:   wal,
 	}
 
 	return pager
