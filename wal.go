@@ -6,11 +6,16 @@ package sqlite3
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"math"
 	"os"
 )
+
+// errWALChanged reports that the log was checkpointed and restarted after it
+// was indexed, so the offsets no longer describe it. Reopening the database
+// picks up the new generation.
+var errWALChanged = errors.New("sqlite3: write-ahead log changed while being read")
 
 // Write-ahead log reader.
 //
@@ -56,18 +61,31 @@ func (w *walIndex) page(i int, buf []byte) (bool, error) {
 		return false, nil
 	}
 	// A checkpoint can restart the log between the scan and this read, leaving
-	// the offset pointing into a later generation's frame. Re-reading the frame
-	// header catches that in every case but a restart that draws the same salt,
-	// which is as much as can be had without rewalking the checksum chain.
+	// the offset pointing into a later generation's frame, or past the end of a
+	// log that was truncated. Both are caught here, all but a restart that
+	// draws the same salt, which would need the checksum chain rewalked per
+	// read to see.
 	var header [walFrameHeaderSize]byte
 	if _, err := w.f.ReadAt(header[:], off); err != nil {
-		return true, err
+		return true, walReadError(err)
 	}
 	if binary.BigEndian.Uint32(header[0:4]) != uint32(i) || string(header[8:16]) != string(w.salt[:]) {
-		return true, fmt.Errorf("sqlite3: write-ahead log changed while being read")
+		return true, errWALChanged
 	}
-	_, err := w.f.ReadAt(buf, off+walFrameHeaderSize)
-	return true, err
+	if _, err := w.f.ReadAt(buf, off+walFrameHeaderSize); err != nil {
+		return true, walReadError(err)
+	}
+	return true, nil
+}
+
+// walReadError reports a short read at an offset the scan already reached as a
+// restart rather than as an I/O fault, since only a truncation can shorten the
+// log and that is how a checkpoint restarts it.
+func walReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return errWALChanged
+	}
+	return err
 }
 
 func (w *walIndex) Close() error {

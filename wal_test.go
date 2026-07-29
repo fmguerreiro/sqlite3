@@ -304,8 +304,34 @@ func TestWALDetectsRestartUnderReader(t *testing.T) {
 	}
 	log.Close()
 
-	if ok, err := index.page(1, buf); !ok || err == nil {
-		t.Errorf("page(1) = %v, %v; want true and an error", ok, err)
+	if ok, err := index.page(1, buf); !ok || err != errWALChanged {
+		t.Errorf("page(1) = %v, %v; want true, %v", ok, err, errWALChanged)
+	}
+}
+
+// PRAGMA wal_checkpoint(TRUNCATE) restarts the log by emptying it, which leaves
+// every indexed offset past the end rather than pointing at a wrong frame. A
+// bare io.EOF here would read as an I/O fault instead of a restart.
+func TestWALDetectsTruncationUnderReader(t *testing.T) {
+	path, cleanup := copyDB(t, true)
+	defer cleanup()
+
+	index, err := openWAL(path, 1024)
+	if err != nil {
+		t.Fatalf("openWAL: %v", err)
+	}
+	if index == nil {
+		t.Fatal("openWAL returned no index for the fixture log")
+	}
+	defer index.Close()
+
+	if err := os.Truncate(path+"-wal", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1024)
+	if ok, err := index.page(1, buf); !ok || err != errWALChanged {
+		t.Errorf("page(1) = %v, %v; want true, %v", ok, err, errWALChanged)
 	}
 }
 
