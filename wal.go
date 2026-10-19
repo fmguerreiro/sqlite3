@@ -17,8 +17,6 @@ import (
 // picks up the new generation.
 var errWALChanged = errors.New("sqlite3: write-ahead log changed while being read")
 
-// Write-ahead log reader.
-//
 // A database in WAL mode keeps recent pages in a separate "-wal" file and only
 // folds them back into the main file at a checkpoint. Reading the main file
 // alone therefore returns whatever the last checkpoint left behind, which for a
